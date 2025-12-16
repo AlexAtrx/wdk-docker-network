@@ -1,6 +1,19 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7.0
+    container_name: redis
+    hostname: redis
+    networks:
+      - wdk-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- MongoDB Replica Set (Existing) ---
   mongo1:
     image: mongo:7.0
     container_name: mongo1
@@ -9,7 +22,7 @@ services:
     ports:
       - "27017:27017"
     networks:
-      - mongo-cluster
+      - wdk-net
     volumes:
       - mongo1-data:/data/db
     healthcheck:
@@ -27,7 +40,7 @@ services:
     ports:
       - "27018:27017"
     networks:
-      - mongo-cluster
+      - wdk-net
     volumes:
       - mongo2-data:/data/db
     healthcheck:
@@ -45,7 +58,7 @@ services:
     ports:
       - "27019:27017"
     networks:
-      - mongo-cluster
+      - wdk-net
     volumes:
       - mongo3-data:/data/db
     healthcheck:
@@ -55,11 +68,207 @@ services:
       retries: 5
       start_period: 30s
 
+  # --- MongoDB Replica Set Init ---
+  mongo-init:
+    image: mongo:7.0
+    container_name: mongo-init
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      mongo2:
+        condition: service_healthy
+      mongo3:
+        condition: service_healthy
+    networks:
+      - wdk-net
+    restart: "no"
+    command: >
+      mongosh --host mongo1:27017 --eval '
+        try {
+          rs.status();
+          print("Replica set already initialized");
+        } catch (e) {
+          print("Initializing replica set...");
+          rs.initiate({
+            _id: "rs0",
+            members: [
+              { _id: 0, host: "mongo1:27017", priority: 1 },
+              { _id: 1, host: "mongo2:27017", priority: 0.5 },
+              { _id: 2, host: "mongo3:27017", priority: 0.5 }
+            ]
+          });
+          print("Replica set initiated");
+        }
+      '
+
+  # --- WDK Services ---
+
+  # 1. ERC20 Indexer Proc (for ERC20 tokens like USDT)
+  # Command: node worker.js --wtype wrk-erc20-indexer-proc --env development --rack eth-proc --chain usdt-eth
+  indexer-evm-proc:
+    build: .
+    container_name: indexer-evm-proc
+    hostname: indexer-evm-proc
+    restart: unless-stopped
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+    networks:
+      - wdk-net
+    volumes:
+      - ../wdk-indexer-wrk-evm:/app
+      - ./scripts:/scripts
+      - shared-keys:/shared-keys
+      - /app/node_modules
+      - /app/store
+      - /app/status
+      - /app/.status
+    environment:
+      - NODE_ENV=development
+    command: >
+      bash -c "npm install && /scripts/start-proc.sh /shared-keys/evm.key node worker.js --wtype wrk-erc20-indexer-proc --env development --rack eth-proc --chain usdt-eth"
+
+  # 2. ERC20 Indexer API (for ERC20 tokens like USDT)
+  # Command: node worker.js --wtype wrk-erc20-indexer-api --env development --rack eth-api --chain usdt-eth --proc-rpc <PROC_KEY>
+  indexer-evm-api:
+    build: .
+    container_name: indexer-evm-api
+    hostname: indexer-evm-api
+    restart: unless-stopped
+    depends_on:
+      - indexer-evm-proc
+    networks:
+      - wdk-net
+    volumes:
+      - ../wdk-indexer-wrk-evm:/app
+      - ./scripts:/scripts
+      - shared-keys:/shared-keys
+      - /app/node_modules
+      - /app/store
+      - /app/status
+      - /app/.status
+    environment:
+      - NODE_ENV=development
+    command: >
+      bash -c "npm install && /scripts/start-api.sh /shared-keys/evm.key node worker.js --wtype wrk-erc20-indexer-api --env development --rack eth-api --chain usdt-eth"
+
+  # 3. Data Shard Proc
+  # Command: node worker.js --wtype wrk-data-shard-proc --env development --rack shard-1
+  data-shard-proc:
+    build: .
+    container_name: data-shard-proc
+    hostname: data-shard-proc
+    restart: unless-stopped
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+    networks:
+      - wdk-net
+    volumes:
+      - ../wdk-data-shard-wrk:/app
+      - ./scripts:/scripts
+      - shared-keys:/shared-keys
+      - /app/node_modules
+      - /app/store
+      - /app/status
+      - /app/.status
+    environment:
+      - NODE_ENV=development
+    command: >
+      bash -c "npm install && /scripts/start-proc.sh /shared-keys/shard.key node worker.js --wtype wrk-data-shard-proc --env development --rack shard-1"
+
+  # 4. Data Shard API
+  # Command: node worker.js --wtype wrk-data-shard-api --env development --rack shard-1-1 --proc-rpc <SHARD_PROC_KEY>
+  data-shard-api:
+    build: .
+    container_name: data-shard-api
+    hostname: data-shard-api
+    restart: unless-stopped
+    depends_on:
+      - data-shard-proc
+    networks:
+      - wdk-net
+    volumes:
+      - ../wdk-data-shard-wrk:/app
+      - ./scripts:/scripts
+      - shared-keys:/shared-keys
+      - /app/node_modules
+      - /app/store
+      - /app/status
+      - /app/.status
+    environment:
+      - NODE_ENV=development
+    command: >
+      bash -c "npm install && /scripts/start-api.sh /shared-keys/shard.key node worker.js --wtype wrk-data-shard-api --env development --rack shard-1-1"
+
+  # 5. Ork API
+  # Command: node worker.js --wtype wrk-ork-api --env development --rack ork-1
+  ork-api:
+    build: .
+    container_name: ork-api
+    hostname: ork-api
+    restart: unless-stopped
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      data-shard-api:
+        condition: service_started
+    networks:
+      - wdk-net
+    volumes:
+      - ../wdk-ork-wrk:/app
+      - /app/node_modules
+      - /app/store
+      - /app/status
+      - /app/.status
+    environment:
+      - NODE_ENV=development
+    command: >
+      bash -c "npm install && node worker.js --wtype wrk-ork-api --env development --rack ork-1"
+
+  # 6. App Node (HTTP)
+  # Command: node worker.js --wtype wdk-server-http-base --env development --port 3000
+  app-node:
+    build: .
+    container_name: app-node
+    hostname: app-node
+    restart: unless-stopped
+    depends_on:
+      mongo1:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      ork-api:
+        condition: service_started
+    networks:
+      - wdk-net
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../wdk-indexer-app-node:/app
+      - /app/node_modules
+      - /app/store
+      - /app/status
+      - /app/.status
+    environment:
+      - NODE_ENV=development
+    command: >
+      bash -c "sed -i 's/127.0.0.1/redis/g' config/facs/redis.config.json && npm install && node worker.js --wtype wdk-server-http-base --env development --port 3000"
+
 networks:
-  mongo-cluster:
+  wdk-net:
     driver: bridge
 
 volumes:
   mongo1-data:
   mongo2-data:
   mongo3-data:
+  shared-keys:

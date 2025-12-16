@@ -1,5 +1,7 @@
 # MongoDB Timeout & Transaction Reproduction
 
+**Note: This is deprecated. Use V2.**
+
 Local 3-member MongoDB replica set for testing timeouts, transactions, and failure scenarios.
 
 ## Setup
